@@ -13,7 +13,8 @@ var fs = require('fs')
   , exists = fs.existsSync || path.existsSync
   , join = path.join
   , mkdirp = require('mkdirp')
-  , jade = require('../');
+  , jade = require('../')
+  , async = require('async');
 
 // jade options
 
@@ -29,8 +30,10 @@ program
   .option('-p, --path <path>', 'filename used to resolve includes')
   .option('-P, --pretty', 'compile pretty html output')
   .option('-c, --client', 'compile function for client-side runtime.js')
+  .option('-j, --js-client <name>', 'compiles all the templates into one single includable javascript file for the client')
   .option('-D, --no-debug', 'compile without debugging (smaller functions)')
   .option('-w, --watch', 'watch files for changes and automatically re-render')
+  .option('-, --watch', 'watch files for changes and automatically re-render')
 
 program.on('--help', function(){
   console.log('  Examples:');
@@ -64,6 +67,7 @@ if (program.obj) {
   }
 }
 
+
 // --filename
 
 if (program.path) options.filename = program.path;
@@ -75,6 +79,12 @@ options.compileDebug = program.debug;
 // --client
 
 options.client = program.client;
+
+// -js-client
+options.jsClient = program.jsClient;
+if (options.jsClient) {
+  options.client = true;
+}
 
 // --pretty
 
@@ -91,12 +101,22 @@ var files = program.args;
 // compile files
 
 if (files.length) {
-  console.log();
-  files.forEach(renderFile);
+
+  if(options.jsClient) {
+    renderSingleJsFile();
+  } else {
+    files.forEach(renderFile);
+  }
   if (options.watch) {
     files.forEach(function (file) {
       fs.watchFile(file, {interval: 100}, function (curr, prev) {
-        if (curr.mtime > prev.mtime) renderFile(file);
+        if (curr.mtime > prev.mtime) {
+          if (options.jsClient) {
+            renderSingleJsFile();
+          } else {
+            renderFile(file);
+          }
+        }
       });
     });
   }
@@ -125,12 +145,82 @@ function stdin() {
   }).resume();
 }
 
+
+function renderSingleJsFile() {
+    var jade_files = [];
+
+    function getJadeFiles(item, cb, prev) {
+        if (typeof item === 'string') {
+            var stat = fs.statSync(item);
+            if (stat.isFile()) {
+                jade_files.push(item);
+                cb();
+            } else if (stat.isDirectory()) {
+                // get all the files in the folder
+                var x = fs.readdirSync(item);
+                getJadeFiles(x, cb, item);
+            } else {
+                cb();
+            }
+        } else {
+          if (prev) {
+            for(var i = 0; i < item.length; i++) {
+              item[i] = prev + '/' + item[i];
+            }
+          }
+          async.forEach(item, getJadeFiles, function(err) {
+            cb();
+          });
+        }
+    };
+
+    getJadeFiles(files, function(){
+       
+        var outObj = {};
+
+        // now jade_files contains an array of all jade files
+        async.forEach(jade_files, function(item, cb){
+            renderFile(item, function(str) {
+              outObj[item] = str;
+              cb();
+            });
+        }, function(err) {
+
+            var output = 'var ' + options.jsClient + ' = ' + options.jsClient + ' ? '+options.jsClient+' : {};\n';
+            for(var filename in outObj) {
+              var out = outObj[filename];
+              if (out != '') {
+                var fn = path.normalize(filename);
+                var basename = path.basename(fn, path.extname(fn));
+                var dirpart = path.dirname(fn);
+                if (dirpart == '.') {
+                  dirpart = '';
+                } else {
+                    dirpart = '/' + dirpart;
+                }
+                output += options.jsClient + '["'+dirpart+'/'+basename+'"] = '+ out +'\n';
+              }
+            }
+
+            output += options.jsClient + '.render = function render(name, locals, attrs, escape, rethrow, merge) { return '+options.jsClient+'[name](locals, attrs, escape, rethrow, merge);  };'
+            
+            fs.writeFile(options.jsClient + '.js', output, function(err){
+                if (err) throw err;
+                console.log('  \033[90mrendered \033[36m%s\033[0m', options.jsClient+'.js');
+            });
+ 
+        });
+
+    });
+
+}
+
 /**
  * Process the given path, compiling the jade files found.
  * Always walk the subdirectories.
  */
 
-function renderFile(path) {
+function renderFile(path, cb) {
   var re = /\.jade$/;
   fs.lstat(path, function(err, stat) {
     if (err) throw err;
@@ -146,13 +236,20 @@ function renderFile(path) {
         var dir = resolve(dirname(path));
         mkdirp(dir, 0755, function(err){
           if (err) throw err;
+
           var output = options.client
             ? fn.toString()
             : fn(options);
-          fs.writeFile(path, output, function(err){
-            if (err) throw err;
-            console.log('  \033[90mrendered \033[36m%s\033[0m', path);
-          });
+
+          if(options.jsClient) {
+            if (cb) cb(output);
+          } else {
+            fs.writeFile(path, output, function(err){
+                if (err) throw err;
+                console.log('  \033[90mrendered \033[36m%s\033[0m', path);
+            });
+          }
+
         });
       });
     // Found directory
@@ -163,6 +260,8 @@ function renderFile(path) {
           return path + '/' + filename;
         }).forEach(renderFile);
       });
+    } else {
+        if (cb) cb('')
     }
   });
 }
